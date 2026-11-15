@@ -93,10 +93,10 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 fn resolve(base: &Path, token: &str) -> PathBuf {
-    if let Some(rest) = token.strip_prefix("~/") {
-        if let Some(h) = home_dir() {
-            return h.join(rest);
-        }
+    if let Some(rest) = token.strip_prefix("~/")
+        && let Some(h) = home_dir()
+    {
+        return h.join(rest);
     }
     let p = Path::new(token);
     if p.is_absolute() {
@@ -109,8 +109,9 @@ fn resolve(base: &Path, token: &str) -> PathBuf {
 /// Short display path: relative to the session cwd when possible.
 fn display(cwd: &Path, path: &Path) -> String {
     path.strip_prefix(cwd)
-        .map(|r| r.display().to_string())
-        .unwrap_or_else(|_| path.display().to_string())
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 enum Block {

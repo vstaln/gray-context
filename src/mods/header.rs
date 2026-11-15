@@ -148,9 +148,6 @@ mod tests {
         }
     }
 
-    /// Env vars are process-global: serialize the tests that set GRAY_HOME.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Point GRAY_HOME at `dir` for the duration of a test; restores on drop.
     struct EnvGuard;
     impl EnvGuard {
@@ -177,7 +174,7 @@ mod tests {
 
     #[test]
     fn prompt_context_is_empty_when_file_missing() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = crate::test_env::ENV_LOCK.lock().unwrap();
         let dir = TempDir::new();
         let _g = EnvGuard::set_home(&dir);
         let r = call("prompt/context", json!({ "session": {} }));
@@ -186,7 +183,7 @@ mod tests {
 
     #[test]
     fn prompt_context_returns_file_contents() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = crate::test_env::ENV_LOCK.lock().unwrap();
         let dir = TempDir::new();
         let _g = EnvGuard::set_home(&dir);
         std::fs::write(dir.0.join("header.txt"), "always be terse\n").unwrap();
@@ -196,7 +193,7 @@ mod tests {
 
     #[test]
     fn prompt_context_is_empty_when_file_blank() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = crate::test_env::ENV_LOCK.lock().unwrap();
         let dir = TempDir::new();
         let _g = EnvGuard::set_home(&dir);
         std::fs::write(dir.0.join("header.txt"), "  \n\n").unwrap();
@@ -206,7 +203,7 @@ mod tests {
 
     #[test]
     fn header_show_and_edit_hint() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = crate::test_env::ENV_LOCK.lock().unwrap();
         let dir = TempDir::new();
         let _g = EnvGuard::set_home(&dir);
         let r = call(
