@@ -53,8 +53,10 @@ fn manifest() -> Value {
     })
 }
 
+type Handler = fn(&Value) -> (Option<Value>, bool);
+
 /// Commands each module owns, routed by `command/run`'s `params.name`.
-fn command_owner(name: &str) -> Option<fn(&Value) -> (Option<Value>, bool)> {
+fn command_owner(name: &str) -> Option<Handler> {
     match name {
         "/header" => Some(header::handle_header),
         "/pin" | "/unpin" | "/pins" => Some(pin::handle_pin),
@@ -83,16 +85,15 @@ fn prompt_context(req: &Value) -> Value {
         include::handle_include,
         dirty::handle_dirty,
     ] {
-        if let (Some(reply), _) = h(req) {
-            if let Some(t) = reply
+        if let (Some(reply), _) = h(req)
+            && let Some(t) = reply
                 .get("result")
                 .and_then(|r| r.get("text"))
                 .and_then(Value::as_str)
-            {
-                let t = t.trim_end();
-                if !t.is_empty() {
-                    parts.push(t.to_string());
-                }
+        {
+            let t = t.trim_end();
+            if !t.is_empty() {
+                parts.push(t.to_string());
             }
         }
     }
@@ -186,4 +187,9 @@ fn main() -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod test_env {
+    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

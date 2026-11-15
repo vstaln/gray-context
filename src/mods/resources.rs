@@ -66,10 +66,10 @@ fn save_list(files: &[String]) -> std::io::Result<()> {
 
 /// Expand a leading `~` / `~/…` against `$HOME`.
 fn expand_tilde(p: &str) -> String {
-    if p == "~" || p.starts_with("~/") {
-        if let Some(home) = std::env::home_dir() {
-            return format!("{}{}", home.display(), &p[1..]);
-        }
+    if (p == "~" || p.starts_with("~/"))
+        && let Some(home) = std::env::home_dir()
+    {
+        return format!("{}{}", home.display(), &p[1..]);
     }
     p.to_string()
 }
@@ -298,7 +298,6 @@ mod tests {
     }
 
     /// Env vars are process-global: serialize the tests that set GRAY_HOME.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     struct EnvGuard;
     impl EnvGuard {
         fn set_home(dir: &TempDir) -> Self {
@@ -330,7 +329,7 @@ mod tests {
 
     #[test]
     fn empty_registry_keeps_messages() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = crate::test_env::ENV_LOCK.lock().unwrap();
         let home = TempDir::new();
         let _g = EnvGuard::set_home(&home);
         let dir = TempDir::new();
@@ -340,7 +339,7 @@ mod tests {
 
     #[test]
     fn pinned_files_are_prepended_as_one_user_message() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = crate::test_env::ENV_LOCK.lock().unwrap();
         let home = TempDir::new();
         let _g = EnvGuard::set_home(&home);
         let dir = TempDir::new();
@@ -363,7 +362,7 @@ mod tests {
 
     #[test]
     fn binaries_are_skipped_and_missing_marked() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = crate::test_env::ENV_LOCK.lock().unwrap();
         let home = TempDir::new();
         let _g = EnvGuard::set_home(&home);
         let dir = TempDir::new();
@@ -378,7 +377,7 @@ mod tests {
 
     #[test]
     fn dedupes_and_removes() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = crate::test_env::ENV_LOCK.lock().unwrap();
         let home = TempDir::new();
         let _g = EnvGuard::set_home(&home);
         let dir = TempDir::new();
@@ -413,7 +412,7 @@ mod tests {
 
     #[test]
     fn caps_at_24kib() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = crate::test_env::ENV_LOCK.lock().unwrap();
         let home = TempDir::new();
         let _g = EnvGuard::set_home(&home);
         let dir = TempDir::new();

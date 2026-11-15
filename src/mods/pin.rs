@@ -339,15 +339,13 @@ fn key_file(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    static LOCK: Mutex<()> = Mutex::new(());
     static CTR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     /// Run `body` with GRAY_HOME pointed at a fresh temp dir. Serialized:
     /// the env var is process-global and tests run in one process.
     fn with_home(body: impl FnOnce(&Path)) {
-        let _g = LOCK.lock().unwrap();
+        let _g = crate::test_env::ENV_LOCK.lock().unwrap();
         let n = CTR.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let home = std::env::temp_dir().join(format!("gray-context-pin-test-{n}"));
         let _ = std::fs::remove_dir_all(&home);
