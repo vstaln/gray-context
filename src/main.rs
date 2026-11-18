@@ -50,6 +50,18 @@ fn manifest() -> Value {
             "/inject", "/header", "/pin", "/unpin", "/pins",
             "/resources", "/rules", "/include", "/dirty", "/ghissues",
         ],
+        "command_descriptions": {
+            "/inject": "list the context-injection modules",
+            "/header": "show the injected header file",
+            "/pin": "pin a file or note into every turn",
+            "/unpin": "drop a pin",
+            "/pins": "list pins",
+            "/resources": "pin files as always-on context",
+            "/rules": "show which rule files get injected",
+            "/include": "expand @path includes in AGENTS.md",
+            "/dirty": "toggle dirty work-tree warnings",
+            "/ghissues": "toggle GitHub issue lookup for #refs",
+        },
         "hooks": ["prompt/context", "context/build", "agent/before_start", "input/submit"],
     })
 }
