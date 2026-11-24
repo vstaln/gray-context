@@ -1,19 +1,8 @@
-//! gray-context — one sidecar for keeping the context window in budget and
-//! putting the right text into it.
 //!
-//! Merges gray-truncate, gray-compact, gray-cacheopt, gray-header,
-//! gray-context-pin, gray-resources, gray-rules, gray-include,
-//! gray-dirty-guard and gray-gh-issues. Each source lives verbatim in `mods/`
-//! with its own state files and slash commands — only the wire plumbing is
-//! shared.
 //!
 //! Hook fan-out:
-//! - `prompt/context`  → header + pin + include + dirty + cacheopt: `{text}`
-//!   results are joined with blank lines (each module contributes or abstains).
 //! - `tool/after`      → truncate (cap oversized tool results).
 //! - `context/build`   → chain: compact (may replace the oldest 70% with a
-//!   summary) → resources (prepend pinned files) → cacheopt observes the list
-//!   that actually goes out.
 //! - `agent/before_start` → rules (rule-file injection).
 //! - `input/submit`    → ghissues (rewrite `#N` mentions with issue titles).
 //! - `event/notify`    → cacheopt (`turn_end` usage → cache stats).
@@ -297,8 +286,6 @@ fn prompt_context(req: &Value, watch: &cacheopt::Watch, parts: &parts::Parts) ->
     }
 }
 
-/// `context/build` chain: compact → resources → cacheopt; cacheopt is
-/// observe-only.
 fn context_build(
     req: &Value,
     watch: &cacheopt::Watch,
