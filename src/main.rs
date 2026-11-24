@@ -1,24 +1,42 @@
-//! gray-context-inject — one sidecar for every "put text into context" plugin.
+//! gray-context — one sidecar for keeping the context window in budget and
+//! putting the right text into it.
 //!
-//! Merges gray-header, gray-context-pin, gray-resources, gray-rules,
-//! gray-include, gray-dirty-guard and gray-gh-issues. Each source lives
-//! verbatim in `mods/` with its own state files and slash commands — only
-//! the wire plumbing is shared.
+//! Merges gray-truncate, gray-compact, gray-cacheopt, gray-header,
+//! gray-context-pin, gray-resources, gray-rules, gray-include,
+//! gray-dirty-guard and gray-gh-issues. Each source lives verbatim in `mods/`
+//! with its own state files and slash commands — only the wire plumbing is
+//! shared.
 //!
 //! Hook fan-out:
-//! - `prompt/context`  → header + pin + include + dirty: `{text}` results are
-//!   joined with blank lines (each module contributes or abstains).
-//! - `context/build`   → resources (message prepend).
+//! - `prompt/context`  → header + pin + include + dirty + cacheopt: `{text}`
+//!   results are joined with blank lines (each module contributes or abstains).
+//! - `tool/after`      → truncate (cap oversized tool results).
+//! - `context/build`   → chain: compact (may replace the oldest 70% with a
+//!   summary) → resources (prepend pinned files) → cacheopt observes the list
+//!   that actually goes out.
 //! - `agent/before_start` → rules (rule-file injection).
 //! - `input/submit`    → ghissues (rewrite `#N` mentions with issue titles).
+//! - `event/notify`    → cacheopt (`turn_end` usage → cache stats).
 //! - `command/run`     → routed by `params.name` to the owning module.
+//!
+//! compact calls back into the host (`host/run`), so the wire loop uses its
+//! reader-thread shape: string-id replies route to pending waiters, every
+//! other frame queues for the main loop.
 
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
+use std::sync::{Arc, Mutex, mpsc};
 
 use serde_json::{Value, json};
 
 mod parts;
 
+#[allow(dead_code)]
+#[path = "mods/cacheopt.rs"]
+mod cacheopt;
+#[allow(dead_code)]
+#[path = "mods/compact.rs"]
+mod compact;
 #[allow(dead_code)]
 #[path = "mods/dirty.rs"]
 mod dirty;
@@ -40,8 +58,26 @@ mod resources;
 #[allow(dead_code)]
 #[path = "mods/rules.rs"]
 mod rules;
+#[allow(dead_code)]
+#[path = "mods/truncate.rs"]
+mod truncate;
 
 const PARTS: &[parts::Part] = &[
+    parts::Part {
+        name: "truncate",
+        default: true,
+        description: "cap oversized tool results before they enter context",
+    },
+    parts::Part {
+        name: "compact",
+        default: true,
+        description: "summarize older context to shrink it",
+    },
+    parts::Part {
+        name: "cacheopt",
+        default: true,
+        description: "prompt-cache hit rate and prefix-break warnings",
+    },
     parts::Part {
         name: "header",
         default: true,
@@ -80,12 +116,26 @@ const PARTS: &[parts::Part] = &[
 ];
 
 fn manifest(parts: &parts::Parts) -> Value {
-    let mut commands: Vec<&str> = vec!["/inject"];
+    let mut commands: Vec<&str> = Vec::new();
     let mut descriptions = serde_json::Map::new();
-    descriptions.insert(
-        "/inject".into(),
-        json!("list the context-injection modules"),
-    );
+    if parts.on("truncate") {
+        commands.push("/truncate");
+        descriptions.insert("/truncate".into(), json!("cap oversized tool results"));
+    }
+    if parts.on("compact") {
+        commands.push("/compact");
+        descriptions.insert(
+            "/compact".into(),
+            json!("summarize older context to shrink it"),
+        );
+    }
+    if parts.on("cacheopt") {
+        commands.push("/cachestats");
+        descriptions.insert(
+            "/cachestats".into(),
+            json!("prompt-cache hit rate and prefix churn"),
+        );
+    }
     if parts.on("header") {
         commands.push("/header");
         descriptions.insert("/header".into(), json!("show the injected header file"));
@@ -122,14 +172,27 @@ fn manifest(parts: &parts::Parts) -> Value {
             json!("toggle GitHub issue lookup for #refs"),
         );
     }
+    let mut completion: Vec<&str> = Vec::new();
+    if parts.on("cacheopt") {
+        completion.push("reset");
+    }
     let mut hooks: Vec<&str> = Vec::new();
-    if ["header", "context-pin", "include", "dirty-guard"]
-        .iter()
-        .any(|p| parts.on(p))
+    if [
+        "header",
+        "context-pin",
+        "include",
+        "dirty-guard",
+        "cacheopt",
+    ]
+    .iter()
+    .any(|p| parts.on(p))
     {
         hooks.push("prompt/context");
     }
-    if parts.on("resources") {
+    if parts.on("truncate") {
+        hooks.push("tool/after");
+    }
+    if parts.on("compact") || parts.on("cacheopt") || parts.on("resources") {
         hooks.push("context/build");
     }
     if parts.on("rules") {
@@ -138,15 +201,22 @@ fn manifest(parts: &parts::Parts) -> Value {
     if parts.on("gh-issues") {
         hooks.push("input/submit");
     }
+    let mut capabilities: Vec<&str> = Vec::new();
+    if parts.on("compact") {
+        capabilities.push("host.turn");
+    }
     json!({
-        "name": "context-inject",
+        "name": "context",
         "version": env!("CARGO_PKG_VERSION"),
         "protocol": "2.0",
+        "sidecar_args": ["sidecar"],
         "tools": [],
-        "description": "inject",
+        "description": "context budget, compaction, cache stats and context injection",
         "commands": commands,
         "command_descriptions": descriptions,
+        "completion": completion,
         "hooks": hooks,
+        "capabilities": capabilities,
         "parts": parts.manifest(PARTS),
     })
 }
@@ -156,6 +226,7 @@ type Handler = fn(&Value) -> (Option<Value>, bool);
 /// Commands each module owns, routed by `command/run`'s `params.name`.
 fn command_owner(name: &str, parts: &parts::Parts) -> Option<Handler> {
     match name {
+        "/truncate" if parts.on("truncate") => Some(truncate::handle_truncate),
         "/header" if parts.on("header") => Some(header::handle_header),
         "/pin" | "/unpin" | "/pins" if parts.on("context-pin") => Some(pin::handle_pin),
         "/resources" if parts.on("resources") => Some(resources::handle_resources),
@@ -173,10 +244,17 @@ fn ghissues_shim(req: &Value) -> (Option<Value>, bool) {
     ghissues::handle_ghissues(&mut p, req)
 }
 
+/// Unwrap a module reply to its `result` (or `{}`), for re-wrapping.
+fn result_of(reply: Option<Value>) -> Value {
+    reply
+        .and_then(|r| r.get("result").cloned())
+        .unwrap_or_else(|| json!({}))
+}
+
 /// `prompt/context` fan-out: every contributing module returns `{text}`;
 /// join the non-empty ones.
-fn prompt_context(req: &Value, parts: &parts::Parts) -> Value {
-    let mut parts_text: Vec<String> = Vec::new();
+fn prompt_context(req: &Value, watch: &cacheopt::Watch, parts: &parts::Parts) -> Value {
+    let mut texts: Vec<String> = Vec::new();
     let mut steps: Vec<Handler> = Vec::new();
     if parts.on("header") {
         steps.push(header::handle_header);
@@ -199,82 +277,105 @@ fn prompt_context(req: &Value, parts: &parts::Parts) -> Value {
         {
             let t = t.trim_end();
             if !t.is_empty() {
-                parts_text.push(t.to_string());
+                texts.push(t.to_string());
             }
         }
     }
-    if parts_text.is_empty() {
-        json!({})
-    } else {
-        json!({ "text": parts_text.join("\n\n") })
-    }
-}
-
-/// `/inject` — merged-plugin overview.
-fn inject_command(parts: &parts::Parts) -> String {
-    let mut lines: Vec<String> = vec![format!(
-        "gray-context-inject {} — one sidecar, seven injection sources:",
-        env!("CARGO_PKG_VERSION")
-    )];
-    let rows: [(&str, &str); 7] = [
-        (
-            "header",
-            "\x20 /header     ~/.gray/header.txt banner into every turn",
-        ),
-        (
-            "context-pin",
-            "\x20 /pin,/unpin,/pins  pinned files/notes into every turn",
-        ),
-        (
-            "resources",
-            "\x20 /resources  always-on files as a synthetic message",
-        ),
-        ("rules", "\x20 /rules      repo rule files at agent start"),
-        (
-            "include",
-            "\x20 /include    @path expansion in context files",
-        ),
-        (
-            "dirty-guard",
-            "\x20 /dirty      uncommitted-changes note at turn start",
-        ),
-        (
-            "gh-issues",
-            "\x20 /ghissues   #N → GitHub issue titles in prompts",
-        ),
-    ];
-    for (part, line) in rows {
-        if parts.on(part) {
-            lines.push(line.to_string());
+    if parts.on("cacheopt") {
+        let (reply, _) = cacheopt::handle_cacheopt(watch, req);
+        if let Some(t) = result_of(reply).get("text").and_then(Value::as_str) {
+            let t = t.trim_end();
+            if !t.is_empty() {
+                texts.push(t.to_string());
+            }
         }
     }
-    lines.join("\n")
+    if texts.is_empty() {
+        json!({})
+    } else {
+        json!({ "text": texts.join("\n\n") })
+    }
 }
 
-fn handle(req: &Value, gh: &mut ghissues::GhIssues, parts: &parts::Parts) -> (Option<Value>, bool) {
+/// `context/build` chain: compact → resources → cacheopt; cacheopt is
+/// observe-only.
+fn context_build(
+    req: &Value,
+    watch: &cacheopt::Watch,
+    link: Option<&compact::HostLink>,
+    parts: &parts::Parts,
+) -> Value {
+    let mut messages: Option<Value> = None;
+    let mut chain = req.clone();
+    if parts.on("compact") {
+        let (reply, _) = compact::handle_compact(&chain, link);
+        if let Some(m) = result_of(reply).get("messages").cloned() {
+            chain["params"]["messages"] = m.clone();
+            messages = Some(m);
+        }
+    }
+    if parts.on("resources") {
+        let (reply, _) = resources::handle_resources(&chain);
+        if let Some(m) = result_of(reply).get("messages").cloned() {
+            chain["params"]["messages"] = m.clone();
+            messages = Some(m);
+        }
+    }
+    if parts.on("cacheopt") {
+        let _ = cacheopt::handle_cacheopt(watch, &chain);
+    }
+    match messages {
+        Some(m) => json!({ "messages": m }),
+        None => json!({}),
+    }
+}
+
+fn handle(
+    req: &Value,
+    gh: &mut ghissues::GhIssues,
+    watch: &cacheopt::Watch,
+    link: Option<&compact::HostLink>,
+    parts: &parts::Parts,
+) -> (Option<Value>, bool) {
     let id = req.get("id").cloned();
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(Value::Null);
     let Some(id) = id else {
+        // Notifications: event/notify turn_end feeds cacheopt's stats.
+        if method == "event/notify" && parts.on("cacheopt") {
+            let _ = cacheopt::handle_cacheopt(watch, req);
+        }
         return (None, method == "plugin/shutdown");
     };
     let result = match method {
         "plugin/manifest" => manifest(parts),
         "prompt/context" => {
-            if !["header", "context-pin", "include", "dirty-guard"]
-                .iter()
-                .any(|p| parts.on(p))
+            if ![
+                "header",
+                "context-pin",
+                "include",
+                "dirty-guard",
+                "cacheopt",
+            ]
+            .iter()
+            .any(|p| parts.on(p))
             {
                 return (Some(json!({ "id": id, "result": {} })), false);
             }
-            prompt_context(req, parts)
+            prompt_context(req, watch, parts)
         }
-        "context/build" => {
-            if !parts.on("resources") {
+        "tool/after" => {
+            if !parts.on("truncate") {
                 return (Some(json!({ "id": id, "result": {} })), false);
             }
-            let (reply, _) = resources::handle_resources(req);
+            let (reply, _) = truncate::handle_truncate(req);
             return (reply, false);
+        }
+        "context/build" => {
+            if !parts.on("compact") && !parts.on("cacheopt") && !parts.on("resources") {
+                return (Some(json!({ "id": id, "result": {} })), false);
+            }
+            context_build(req, watch, link, parts)
         }
         "agent/before_start" => {
             if !parts.on("rules") {
@@ -292,16 +393,17 @@ fn handle(req: &Value, gh: &mut ghissues::GhIssues, parts: &parts::Parts) -> (Op
         }
         "command/run" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-            if name == "/inject" {
-                json!({ "text": inject_command(parts) })
-            } else if let Some(owner) = command_owner(name, parts) {
-                let (reply, _) = owner(req);
-                match reply {
-                    Some(r) => r.get("result").cloned().unwrap_or(json!({})),
-                    None => json!({}),
+            match name {
+                "/compact" if parts.on("compact") => {
+                    result_of(compact::handle_compact(req, link).0)
                 }
-            } else {
-                json!({ "text": format!("unknown command {name} — try /inject") })
+                "/cachestats" if parts.on("cacheopt") => {
+                    result_of(cacheopt::handle_cacheopt(watch, req).0)
+                }
+                _ => match command_owner(name, parts) {
+                    Some(owner) => result_of(owner(req).0),
+                    None => json!({ "text": format!("unknown command {name}") }),
+                },
             }
         }
         "plugin/shutdown" => return (Some(json!({ "id": id, "result": {} })), true),
@@ -313,30 +415,58 @@ fn handle(req: &Value, gh: &mut ghissues::GhIssues, parts: &parts::Parts) -> (Op
     (Some(json!({ "id": id, "result": result })), false)
 }
 
-fn main() -> std::io::Result<()> {
-    let parts = parts::Parts::load("context-inject", PARTS);
+fn main() {
+    let parts = parts::Parts::load("context", PARTS);
     if std::env::args().nth(1).as_deref() == Some("manifest") {
         println!("{}", manifest(&parts));
-        return Ok(());
+        return;
     }
+    let stdout = Arc::new(Mutex::new(std::io::stdout()));
+    let pending: compact::Pending = Arc::new(Mutex::new(HashMap::new()));
+    let counter = Arc::new(Mutex::new(0u64));
+    let watch = cacheopt::Watch::default();
     let mut gh = ghissues::GhIssues::new();
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        let Ok(req) = serde_json::from_str::<Value>(&line) else {
-            continue;
+
+    // Reader thread: `host/run` replies (string id, no method) route to
+    // pending waiters; everything else queues for the main loop.
+    let (work_tx, work_rx) = mpsc::channel::<Value>();
+    let reader_pending = pending.clone();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            let Ok(line) = line else { break };
+            let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if let Some(id) = v.get("id").and_then(|i| i.as_str())
+                && v.get("method").is_none()
+                && let Some(tx) = reader_pending.lock().expect("pending").remove(id)
+            {
+                let _ = tx.send(v);
+                continue;
+            }
+            if work_tx.send(v).is_err() {
+                break;
+            }
+        }
+    });
+
+    for req in work_rx {
+        let link = compact::HostLink {
+            out: stdout.clone(),
+            pending: pending.clone(),
+            counter: counter.clone(),
         };
-        let (reply, exit) = handle(&req, &mut gh, &parts);
+        let (reply, exit) = handle(&req, &mut gh, &watch, Some(&link), &parts);
         if let Some(reply) = reply {
-            writeln!(stdout, "{reply}")?;
-            stdout.flush()?;
+            let mut o = stdout.lock().expect("stdout");
+            let _ = writeln!(o, "{reply}");
+            let _ = o.flush();
         }
         if exit {
             break;
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
