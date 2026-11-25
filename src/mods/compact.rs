@@ -66,30 +66,25 @@ fn next_id(counter: &Arc<Mutex<u64>>) -> String {
     format!("q{n}")
 }
 
-/// `host/run` one prompt, returning the reply text. Every failure — no grant,
-/// overload, timeout, malformed reply — is an `Err`, never a panic.
-fn host_run(link: Option<&HostLink>, prompt: &str) -> Result<String, String> {
-    let Some(link) = link else {
-        return Err("host/run unavailable".into());
-    };
-    let id = next_id(&link.counter);
-    let (tx, rx) = mpsc::channel();
-    link.pending.lock().expect("pending").insert(id.clone(), tx);
-    let req = json!({"id": id, "method": "host/run", "params": {"prompt": prompt}});
-    {
-        let mut o = link.out.lock().expect("stdout");
-        if writeln!(o, "{req}").and_then(|_| o.flush()).is_err() {
-            link.pending.lock().expect("pending").remove(&id);
-            return Err("host/run: wire write failed".into());
-        }
+const LATE_TTL: Duration = Duration::from_secs(900);
+
+static IN_FLIGHT: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+
+fn claim_flight(sid: &str) -> bool {
+    IN_FLIGHT
+        .lock()
+        .expect("in flight")
+        .get_or_insert_with(Default::default)
+        .insert(sid.to_string())
+}
+
+fn release_flight(sid: &str) {
+    if let Some(set) = IN_FLIGHT.lock().expect("in flight").as_mut() {
+        set.remove(sid);
     }
-    let reply = match rx.recv_timeout(RUN_TTL) {
-        Ok(v) => v,
-        Err(_) => {
-            link.pending.lock().expect("pending").remove(&id);
-            return Err("host/run did not answer in time".into());
-        }
-    };
+}
+
+fn parse_reply(reply: &Value) -> Result<String, String> {
     if let Some(text) = reply.pointer("/result/text").and_then(Value::as_str)
         && !text.trim().is_empty()
     {
@@ -107,6 +102,66 @@ fn host_run(link: Option<&HostLink>, prompt: &str) -> Result<String, String> {
         return Err(format!("host/run: {e}"));
     }
     Err("host/run: empty reply".into())
+}
+
+fn summarize(
+    link: Option<&HostLink>,
+    sid: &str,
+    prompt: &str,
+    prefix_len: usize,
+    hash: String,
+    wait: Duration,
+) -> Option<String> {
+    let link = link?;
+    if !claim_flight(sid) {
+        return None;
+    }
+    let id = next_id(&link.counter);
+    let (tx, rx) = mpsc::channel();
+    link.pending.lock().expect("pending").insert(id.clone(), tx);
+    let req = json!({"id": id, "method": "host/run", "params": {"prompt": prompt}});
+    {
+        let mut o = link.out.lock().expect("stdout");
+        if writeln!(o, "{req}").and_then(|_| o.flush()).is_err() {
+            link.pending.lock().expect("pending").remove(&id);
+            release_flight(sid);
+            return None;
+        }
+    }
+    let (done_tx, done_rx) = mpsc::channel();
+    let pending = link.pending.clone();
+    let sid = sid.to_string();
+    std::thread::spawn(move || {
+        let summary = match rx.recv_timeout(LATE_TTL) {
+            Ok(reply) => parse_reply(&reply).ok(),
+            Err(_) => {
+                pending.lock().expect("pending").remove(&id);
+                None
+            }
+        };
+        if let Some(summary) = &summary {
+            let mut cache = load_cache(&sid);
+            cache["prefix_len"] = json!(prefix_len);
+            cache["prefix_hash"] = json!(hash);
+            cache["summary"] = json!(summary);
+            save_cache(&sid, &cache);
+        }
+        release_flight(&sid);
+        let _ = done_tx.send(summary);
+    });
+    done_rx.recv_timeout(wait).ok().flatten()
+}
+
+fn cached_summary(cache: &Value, messages: &[Value]) -> Option<(String, usize)> {
+    let len = usize::try_from(cache.get("prefix_len")?.as_u64()?).ok()?;
+    if len == 0 || len >= messages.len() {
+        return None;
+    }
+    let hash = cache.get("prefix_hash")?.as_str()?;
+    if prefix_hash(&serialize_messages(&messages[..len])) != hash {
+        return None;
+    }
+    Some((cache.get("summary")?.as_str()?.to_string(), len))
 }
 
 // --- conversation serialization --------------------------------------------
@@ -333,32 +388,42 @@ fn compact_reply(messages: &[Value], sid: &str, link: Option<&HostLink>) -> Opti
     if !forced && total_chars <= threshold_chars() {
         return None;
     }
-    let keep = (messages.len() * KEEP_NUM / KEEP_DEN).max(1);
-    let prefix_len = messages.len() - keep;
-    let prefix_text = serialize_messages(&messages[..prefix_len]);
-    let hash = prefix_hash(&prefix_text);
-
     let mut cache = load_cache(sid);
-    let summary = if cache.get("prefix_hash").and_then(Value::as_str) == Some(hash.as_str()) {
-        cache
-            .get("summary")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    } else {
-        // Fail open: a broken summarizer must never eat a request.
-        host_run(link, &summary_prompt(&prefix_text)).ok()
-    };
-    let Some(summary) = summary else {
-        cache["chars"] = json!(total_chars);
-        cache["messages"] = json!(messages.len());
-        save_cache(sid, &cache);
-        return None;
-    };
-    cache["prefix_hash"] = json!(hash);
-    cache["summary"] = json!(summary);
     cache["chars"] = json!(total_chars);
     cache["messages"] = json!(messages.len());
     save_cache(sid, &cache);
+    let reused = cached_summary(&cache, messages);
+    let stale = match &reused {
+        Some((summary, len)) => {
+            forced
+                || summary.chars().count() + serialize_messages(&messages[*len..]).chars().count()
+                    > threshold_chars()
+        }
+        None => true,
+    };
+    let fresh = if stale {
+        let keep = (messages.len() * KEEP_NUM / KEEP_DEN).max(1);
+        let prefix_len = messages.len() - keep;
+        let prefix_text = serialize_messages(&messages[..prefix_len]);
+        let hash = prefix_hash(&prefix_text);
+        let wait = if forced || reused.is_none() {
+            RUN_TTL
+        } else {
+            Duration::ZERO
+        };
+        summarize(
+            link,
+            sid,
+            &summary_prompt(&prefix_text),
+            prefix_len,
+            hash,
+            wait,
+        )
+        .map(|summary| (summary, prefix_len))
+    } else {
+        None
+    };
+    let (summary, prefix_len) = fresh.or(reused)?;
 
     let head = json!({
         "role": "user",

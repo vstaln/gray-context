@@ -1,6 +1,6 @@
 [package]
 name = "gray-context"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Merged context plugin for the gray agent harness: truncate, compact, cacheopt, header, context-pin, resources, rules, include, dirty-guard, gh-issues in one sidecar."
 license = "MIT"
